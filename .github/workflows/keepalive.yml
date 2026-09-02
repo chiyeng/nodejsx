@@ -1,0 +1,88 @@
+name: Keep-Alive Restart Container
+
+on:
+  schedule:
+    # Every 20 minutes, independent of the container's lifetime
+    - cron: '*/20 * * * *'
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'keepalive.sh'
+      - 'Dockerfile'
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Ping web entrypoints
+        id: ping
+        continue-on-error: true
+        run: |
+          for url in \
+            "https://work-1-cjpomvidncnectdw.prod-runtime.all-hands.dev/" \
+            "https://work-2-cjpomvidncnectdw.prod-runtime.all-hands.dev/"; do
+            code="$(curl -m 10 -sS -o /dev/null -w '%{http_code}' "$url" || true)"
+            echo "$url -> HTTP $code"
+          done
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        if: always()
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        if: always()
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        if: always()
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        if: always()
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/xhly:5098
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=HTTP Server
+            org.opencontainers.image.licenses=MIT
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Restart the remote container.  Wire up one of the options below
+      # with repository secrets and the keepalive cron will restart the
+      # container every 20 minutes (the new image boots index.js via keepalive.sh).
+      - name: Restart remote deployment via webhook
+        if: always() && secrets.DEPLOY_WEBHOOK_URL != ''
+        run: |
+          echo "Triggering restart webhook..."
+          curl -m 20 -fsS -X POST "${{ secrets.DEPLOY_WEBHOOK_URL }}" \
+            || echo "::warning::webhook restart failed"
+
+      - name: Restart remote container via SSH
+        if: always() && secrets.SSH_HOST != '' && secrets.SSH_USER != '' && secrets.SSH_CONTAINER != ''
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT || '22' }}
+          script: |
+            docker restart ${{ secrets.SSH_CONTAINER }} ||
+            (cd "$(dirname "${{ secrets.SSH_CONTAINER }}")" && docker compose up -d --force-recreate)
